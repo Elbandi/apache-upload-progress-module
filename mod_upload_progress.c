@@ -1,18 +1,19 @@
 #include <stdint.h>
+#include <ctype.h>
+#include <time.h>
 #include <ap_config.h>
 #include <http_core.h>
 #include <http_log.h>
+#include <http_protocol.h>
+#include <http_request.h>
 #include <apr_version.h>
 #include <apr_pools.h>
 #include <apr_strings.h>
 #include "unixd.h"
 
-#if APR_HAS_SHARED_MEMORY
-#include "apr_rmm.h"
-#include "apr_shm.h"
-#else
-#error "APR_HAS_SHARED_MEMORY required for upload_progress module"
-#endif
+#include <mysql.h>
+#include <errmsg.h>
+#include <mysqld_error.h>
 
 #if APR_HAVE_UNISTD_H
 #include <unistd.h>
@@ -25,14 +26,6 @@
 #endif
 #ifndef JSON_CB_PARAM
 #  define JSON_CB_PARAM "callback"
-#endif
-#ifndef CACHE_FILENAME
-#  define CACHE_FILENAME "/tmp/upload_progress_cache"
-#endif
-#ifndef PROGRESS_EXPIRES
-/* shared memory entries not updated in PROGRESS_EXPIRES seconds
-   will be reused when needed */
-#  define PROGRESS_EXPIRES 60
 #endif
 #ifndef UP_DEBUG
 #  define UP_DEBUG 0
@@ -48,7 +41,7 @@
 #  define ARG_MINLEN_PROGRESSID 8
 #endif
 #ifndef ARG_MAXLEN_PROGRESSID
-#  define ARG_MAXLEN_PROGRESSID 128
+#  define ARG_MAXLEN_PROGRESSID 64
 #endif
 #define UP_STRINGIFY(arg) #arg
 #define UP_TOSTRING(arg) UP_STRINGIFY(arg)
@@ -71,29 +64,11 @@
 #  define up_log(...)
 #endif
 
-#define CACHE_LOCK() do {                                  \
-    if (config->cache_lock) {                              \
-        char errbuf[200];                                  \
-        up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "CACHE_LOCK()"); \
-        apr_status_t status = apr_global_mutex_lock(config->cache_lock);        \
-        if (status != APR_SUCCESS) {                          \
-            ap_log_error(APLOG_MARK, APLOG_CRIT, status, server, \
-                       "%s", apr_strerror(status, errbuf, sizeof(errbuf))); \
-        }                                                  \
-    } \
-} while (0)
-
-#define CACHE_UNLOCK() do {                                \
-    if (config->cache_lock)                               \
-    {	\
-        up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "CACHE_UNLOCK()"); \
-        apr_global_mutex_unlock(config->cache_lock);      \
-    }	\
-} while (0)
-
 typedef struct {
     int track_enabled;
     int report_enabled;
+    char *track_table;
+    char *progress_id;
 } DirConfig;
 
 typedef struct upload_progress_node_s{
@@ -113,23 +88,23 @@ typedef struct {
 } upload_progress_req_t;
 
 typedef struct {
-    int count;
-    int active;
-} upload_progress_cache_t;
+    char *db_host;
+    char *db_name;
+    char *db_user;
+    char *db_pwd;
+    char *db_socket;
+    unsigned int db_port;
+    MYSQL *dbh;
 
-typedef struct {
-    apr_global_mutex_t *cache_lock;
-    char *lock_file;           /* filename for shm lock mutex */
-    apr_size_t cache_bytes;
-    apr_shm_t *cache_shm;
-    char *cache_file;
-    upload_progress_cache_t *cache;
-    int *list; /* static array of node indexes, list begins with indexes of active nodes */
-    upload_progress_node_t *nodes; /* all nodes allocated at once */
+    /* Some MySQL errors are retryable; if we retry the operation
+     * by recursing into the same function, we set this so we don't
+     * recurse indefinitely if it's a permanent error.
+     */
+    unsigned char dbh_error_lastchance;
 } ServerConfig;
 
-static void upload_progress_cache_write(server_rec *, upload_progress_node_t *);
-static upload_progress_node_t *find_node(server_rec *, const char *);
+static int upload_progress_cache_write(request_rec *, char *);
+static apr_status_t upload_progress_mysql_cleanup(void *);
 static apr_status_t upload_progress_cleanup(void *);
 static const char *get_progress_id(request_rec *, int *);
 
@@ -152,7 +127,6 @@ static inline upload_progress_req_t *get_request_config(request_rec *r)
     return (upload_progress_req_t *)ap_get_module_config(r->request_config, &upload_progress_module);
 }
 
-
 static int upload_progress_handle_request(request_rec *r)
 {
     server_rec *server = r->server;
@@ -168,8 +142,15 @@ static int upload_progress_handle_request(request_rec *r)
                      "Upload Progress: Non-POST request in trackable location: %s.", r->uri);
         return DECLINED;
     }
+    upload_progress_req_t *ri = get_request_config(r);
+    if (ri) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server,
+                     "Upload Progress: Request info exists in trackable location: %s.", r->uri);
+        return DECLINED;
+    }
 
     int param_error;
+    char *query;
     const char *id = get_progress_id(r, &param_error);
 
     if (id) {
@@ -181,7 +162,7 @@ static int upload_progress_handle_request(request_rec *r)
         upload_progress_node_t *node = NULL;
         if (reqinfo) {
             reqinfo->cache_updated_at = apr_time_now();
-            upload_progress_node_t *node = &(reqinfo->node);
+            node = &(reqinfo->node);
 
             strncpy(node->key, id, ARG_MAXLEN_PROGRESSID);
             time_t t = time(NULL);
@@ -203,7 +184,16 @@ static int upload_progress_handle_request(request_rec *r)
         apr_pool_cleanup_register(r->pool, r, upload_progress_cleanup, apr_pool_cleanup_null);
         ap_add_input_filter("UPLOAD_PROGRESS", NULL, r, r->connection);
 
-        upload_progress_cache_write(server, node);
+        if (node) {
+            query = (char *) apr_psprintf(r->pool, "INSERT IGNORE INTO %s (id, length, err_status, "
+                "received, done, started_at, speed, updated_at)"
+                " VALUES ('%s', %" APR_OFF_T_FMT ", %d, %" APR_OFF_T_FMT ", %d, %ld, %" APR_OFF_T_FMT ", %ld);",
+                dir->track_table, node->key, node->length, node->err_status, node->received,
+                node->done, node->started_at, node->speed, node->updated_at);
+            if (upload_progress_cache_write(r, query) < 0) {
+                return HTTP_INTERNAL_SERVER_ERROR;
+            }
+        }
 
     } else if (param_error < 0) {
         ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server,
@@ -237,20 +227,67 @@ static const char *track_upload_progress_cmd(cmd_parms *cmd, void *config, int a
     return NULL;
 }
 
-static const char* upload_progress_shared_memory_size_cmd(cmd_parms *cmd,
-                                                 void *dummy, const char *arg)
+static const char *table_upload_progress_cmd(cmd_parms *cmd, void *config, const char *arg)
 {
-/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_shared_memory_size_cmd()");
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "table_upload_progress_cmd()");
+    DirConfig *dir = (DirConfig *)config;
+    dir->track_table = (char *)arg;
+    return NULL;
+}
+
+static const char *key_upload_progress_cmd(cmd_parms *cmd, void *config, const char *arg)
+{
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "key_upload_progress_cmd()");
+    DirConfig *dir = (DirConfig *)config;
+    dir->progress_id = (char *)arg;
+    return NULL;
+}
+
+static const char* upload_progress_mysql_info(cmd_parms *cmd,
+                            void *dummy, const char *host, const char *user,
+                            const char *pwd)
+{
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_mysql_info()");
     ServerConfig *config = get_server_config(cmd->server);
 
-    long long int n = atoi(arg);
-
-    if (n <= 0) {
-        return "UploadProgressSharedMemorySize should be positive";
+    if (*host != '.') {
+        config->db_host = (char *)host;
     }
 
-    config->cache_bytes = (apr_size_t)n;
+    if (*user != '.') {
+        config->db_user = (char *)user;
+    }
 
+    if (*pwd != '.') {
+        config->db_pwd = (char *)pwd;
+    }
+
+    return NULL;
+}
+
+static const char *upload_progress_mysql_socket(cmd_parms *cmd, void *dummy, const char *sock)
+{
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_mysql_socket()");
+    ServerConfig *config = get_server_config(cmd->server);
+    config->db_socket = (char *)socket;
+    return NULL;
+}
+
+/* Set the server-wide database server port.
+ */
+static const char *upload_progress_mysql_port(cmd_parms *cmd, void *dummy, const char *port)
+{
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_mysql_port()");
+    ServerConfig *config = get_server_config(cmd->server);
+    config->db_port = (unsigned int) atoi(port);
+    return NULL;
+}
+
+static const char *upload_progress_mysql_db(cmd_parms *cmd, void *dummy, const char *db)
+{
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_mysql_db()");
+    ServerConfig *config = get_server_config(cmd->server);
+    config->db_name = (char *)db;
     return NULL;
 }
 
@@ -258,8 +295,12 @@ static void *upload_progress_create_dir_config(apr_pool_t *p, char *dirspec)
 {
 /**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_create_dir_config()");
     DirConfig *dir = (DirConfig *)apr_pcalloc(p, sizeof(DirConfig));
-    dir->track_enabled = 0;
-    dir->report_enabled = 0;
+    if (dir) {
+        dir->track_enabled = 0;
+        dir->report_enabled = 0;
+        dir->track_table = "uploads";
+        dir->progress_id = PROGRESS_ID;
+    }
     return dir;
 }
 
@@ -272,6 +313,10 @@ static void *upload_progress_merge_dir_config(apr_pool_t *p, void *basev, void *
                              (override->track_enabled > 0 ? 1 : -1);
     new->report_enabled = (override->report_enabled == 0) ? base->report_enabled :
                               (override->report_enabled > 0 ? 1 : -1);
+    new->track_table = (override->track_table == NULL) ? base->track_table :
+                            override->track_table;
+    new->progress_id = (override->progress_id == NULL) ? base->progress_id :
+                            override->progress_id;
     return new;
 }
 
@@ -280,8 +325,18 @@ static void *upload_progress_create_server_config(apr_pool_t *p, server_rec *s)
     if (!global_server) global_server = s;
 /**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_create_server_config()");
     ServerConfig *config = (ServerConfig *)apr_pcalloc(p, sizeof(ServerConfig));
-    config->cache_file = apr_pstrdup(p, CACHE_FILENAME);
-    config->cache_bytes = 51200;
+    if (config) {
+        config->db_host = "localhost";
+        config->db_user = "root";
+        config->db_pwd = "";
+        config->db_name = "upload";
+        config->db_socket = NULL;
+        config->db_port = 3306;
+
+        config->dbh_error_lastchance = 0;
+        config->dbh = NULL;
+        apr_pool_cleanup_register(p, config, upload_progress_mysql_cleanup, apr_pool_cleanup_null);
+    }
     return config;
 }
 
@@ -308,6 +363,141 @@ static int read_request_status(request_rec *r)
     }
 }
 
+static apr_status_t upload_progress_mysql_result_cleanup(void *result)
+{
+    mysql_free_result((MYSQL_RES *) result);
+    return APR_SUCCESS;
+}
+
+/* Make a MySQL database link open and ready for business.  Returns 0 on
+ * success, or the MySQL error number which caused the failure if there was
+ * some sort of problem.
+ */
+static int open_upload_dblink(request_rec *r, ServerConfig *config)
+{
+    server_rec *server = r->server;
+    void (*sigpipe_handler)();
+    unsigned long client_flag = 0;
+#if MYSQL_VERSION_ID >= 50013
+    my_bool do_reconnect = 1;
+#endif
+
+    ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server, "Opening DB connection");
+
+    /* MySQL likes to throw the odd SIGPIPE now and then - ignore it for now */
+    sigpipe_handler = signal(SIGPIPE, SIG_IGN);
+
+    config->dbh = mysql_init(NULL);
+
+    if (!mysql_real_connect(config->dbh, config->db_host, config->db_user, config->db_pwd, config->db_name, config->db_port, config->db_socket, client_flag)) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, server,
+             "Connection error: %s", mysql_error(config->dbh));
+        errno = mysql_errno(config->dbh);
+        mysql_close(config->dbh);
+        config->dbh = NULL;
+        return errno;
+    }
+
+#if MYSQL_VERSION_ID >= 50013
+    /* The default is no longer to automatically reconnect on failure,
+     * (as of 5.0.3) so we have to set that option here.  The option is
+     * available from 5.0.13.  */
+    mysql_options(config->dbh, MYSQL_OPT_RECONNECT, &do_reconnect);
+#endif
+
+    signal(SIGPIPE, sigpipe_handler);
+
+    /* W00t!  We made it! */
+    return 0;
+}
+
+/* Run a query against the database.  Doesn't assume nearly anything about
+ * the state of affairs regarding the database connection.
+ * Returns 0 on a successful query run, or the MySQL error number on
+ * error.  It is the responsibility of the calling function to retrieve any
+ * data which may have been obtained through the running of this function.
+ */
+static int safe_mysql_query(request_rec *r, char *query, ServerConfig *config)
+{
+    server_rec *server = r->server;
+    int error = CR_UNKNOWN_ERROR;
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "safe_mysql_query()");
+
+    up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "dbh is %p", config->dbh);
+    if (config->dbh_error_lastchance)
+    {
+        up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "Last chance, bub");
+    }
+    else
+    {
+        up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "Ordinary query");
+    }
+
+    if (!config->dbh) {
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server,
+            "No DB connection open - firing one up");
+        if ((error = open_upload_dblink(r, config))) {
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server,
+                "open_auth_dblink returned %i", error);
+            return error;
+        }
+
+        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server,
+            "Correctly opened a new DB connection");
+    }
+
+    up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "Running query: [%s]", query);
+
+    if (mysql_query(config->dbh, query)) {
+        error = mysql_errno(config->dbh);
+
+        up_log(APLOG_MARK, APLOG_DEBUG, 0, server,
+            "Query maybe-failed: %s (%i), lastchance=%i", mysql_error(config->dbh), error, config->dbh_error_lastchance);
+        up_log(APLOG_MARK, APLOG_DEBUG, 0, server,
+            "Error numbers of interest are %i (SG) and %i (SL)",
+            CR_SERVER_GONE_ERROR, CR_SERVER_LOST);
+        if (config->dbh_error_lastchance)
+        {
+            /* No matter what error, we're moving out */
+            return error;
+        }
+        else if (error == CR_SERVER_LOST || error == CR_SERVER_GONE_ERROR)
+        {
+            /* Try again, once more only */
+            config->dbh_error_lastchance = 1;
+            config->dbh = NULL;
+            up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "Retrying query");
+            return safe_mysql_query(r, query, config);
+        }
+        else
+        {
+            return error;
+        }
+    }
+
+    return 0;
+}
+
+/* Store the result of a query in a result structure, and return it.  It's
+ * "safe" in the fact that a cleanup function is registered for the structure
+ * so it will be tidied up after the request.
+ * Returns the result data on success, or NULL if there was no data to retrieve.
+ */
+static MYSQL_RES *safe_mysql_store_result(apr_pool_t *p, ServerConfig *config)
+{
+    MYSQL_RES *result;
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "safe_mysql_store_result()");
+
+    result = mysql_store_result(config->dbh);
+
+    if (result) {
+        apr_pool_cleanup_register(p, (void *) result, upload_progress_mysql_result_cleanup, upload_progress_mysql_result_cleanup);
+    }
+
+    return result;
+}
+
+
 static int track_upload_progress(ap_filter_t *f, apr_bucket_brigade *bb,
                            ap_input_mode_t mode, apr_read_type_e block,
                            apr_off_t readbytes)
@@ -315,6 +505,7 @@ static int track_upload_progress(ap_filter_t *f, apr_bucket_brigade *bb,
     server_rec *server = f->r->server;
 /**/up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "track_upload_progress()");
 
+    char *query;
     apr_status_t rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
 
     upload_progress_req_t *reqinfo = get_request_config(f->r);
@@ -343,8 +534,12 @@ static int track_upload_progress(ap_filter_t *f, apr_bucket_brigade *bb,
 
     apr_time_t now = apr_time_now();
     if ((now - reqinfo->cache_updated_at) > apr_time_from_msec(500)) {
+        DirConfig *dir = get_dir_config(f->r);
         reqinfo->cache_updated_at = now;
-        upload_progress_cache_write(server, node);
+        query = (char *) apr_psprintf(f->r->pool, "UPDATE %s SET err_status = %d, received = %" APR_OFF_T_FMT ", "
+            "length = %" APR_OFF_T_FMT ", speed = %" APR_OFF_T_FMT ", updated_at = %ld WHERE id = '%s';",
+            dir->track_table, node->err_status, node->received, node->length, node->speed, node->updated_at, node->key);
+        upload_progress_cache_write(f->r, query);
     }
 
     return rv;
@@ -381,10 +576,11 @@ static char *get_param_value(char *p, const char *param_name, int *len) {
 }
 
 static const char *get_progress_id(request_rec *r, int *param_error) {
+    DirConfig *dir = get_dir_config(r);
     int len;
 
     /* try to find progress id in http headers */
-    const char *id  = apr_table_get(r->headers_in, PROGRESS_ID);
+    const char *id  = apr_table_get(r->headers_in, dir->progress_id);
     if (id) {
         *param_error = check_request_argument(id, strlen(id), ARG_ALLOWED_PROGRESSID,
             ARG_MINLEN_PROGRESSID, ARG_MAXLEN_PROGRESSID);
@@ -393,7 +589,7 @@ static const char *get_progress_id(request_rec *r, int *param_error) {
     }
 
     /* if progress id not found in headers, check request args (query string) */
-    id = get_param_value(r->args, PROGRESS_ID, &len);
+    id = get_param_value(r->args, dir->progress_id, &len);
     if (id) {
         *param_error = check_request_argument(id, len, ARG_ALLOWED_PROGRESSID,
             ARG_MINLEN_PROGRESSID, ARG_MAXLEN_PROGRESSID);
@@ -425,30 +621,26 @@ static inline int check_node(upload_progress_node_t *node, const char *key) {
     return ((node) && (strncasecmp(node->key, key, ARG_MAXLEN_PROGRESSID) == 0)) ? 1 : 0;
 }
 
-static upload_progress_node_t *find_node(server_rec *server, const char *key) {
-/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "find_node()");
+static apr_status_t upload_progress_mysql_cleanup(void *data)
+{
+/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_mysql_cleanup()");
+    ServerConfig *config = data;
 
-    ServerConfig *config = get_server_config(server);
-    upload_progress_cache_t *cache = config->cache;
-    upload_progress_node_t *node, *nodes = config->nodes;
-    int *list = config->list;
-    int active = cache->active;
-    int i;
-
-    for (i = 0; i < active; i++) {
-        node = &nodes[list[i]];
-        if (check_node(node, key))
-          return node;
+    if (config->dbh) {
+        mysql_close(config->dbh);
+        config->dbh = NULL;
     }
-    return NULL;
+    return APR_SUCCESS;
 }
 
 static apr_status_t upload_progress_cleanup(void *data)
 {
     request_rec *r = (request_rec *)data;
     server_rec *server = r->server;
+    DirConfig *dir = get_dir_config(r);
 /**/up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "upload_progress_cleanup()");
 
+    char *query;
     upload_progress_req_t *reqinfo = get_request_config(r);
     if (!reqinfo) {
         up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "Request config not available");
@@ -458,176 +650,37 @@ static apr_status_t upload_progress_cleanup(void *data)
     node->err_status = read_request_status(r);
     node->updated_at = time(NULL);
     node->done = 1;
-    upload_progress_cache_write(server, node);
+    query = (char *) apr_psprintf(r->pool, "UPDATE %s SET err_status = %d, "
+            "done = %d, updated_at = %ld WHERE id = '%s';",
+            dir->track_table, node->err_status, node->done, node->updated_at, node->key);
+    upload_progress_cache_write(r, query);
 
     return APR_SUCCESS;
 }
 
-static void upload_progress_cache_write(server_rec *server, upload_progress_node_t *new_data)
+static int upload_progress_cache_write(request_rec *r, char *query)
 {
-    if (!new_data) return;
+    server_rec *server = r->server;
     ServerConfig *config = get_server_config(server);
+    int rv;
 
-    CACHE_LOCK();
-    upload_progress_node_t *node = find_node(server, new_data->key);
-    time_t now = time(NULL);
-#define EXPIRED(node,now) ((now - node->updated_at) > PROGRESS_EXPIRES)
-    if (node) {
-        /* reuse node if: request finished, expired, or same started_at as node */
-        if (node->started_at == new_data->started_at || node->done || EXPIRED(node, now)) {
-            memcpy(node, new_data, sizeof(upload_progress_node_t));
-            up_log(APLOG_MARK, APLOG_DEBUG, 0, server,
-                         "Upload Progress: Reused existing node with id='%" UP_ID_FMT "'.", node->key);
-        } else {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server,
-                         "Upload Progress: Upload with id='%" UP_ID_FMT "' already exists, ignoring.", node->key);
-        }
-    } else {
-
-        up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "cleaning expired cache nodes");
-
-        upload_progress_cache_t *cache = config->cache;
-        upload_progress_node_t *nodes = config->nodes;
-        int *list = config->list;
-        int i, tmp;
-
-        /* check active nodes list, if expired node found
-           then swap it with last active and shrink active list by one */
-        for (i = 0; i < cache->active; i++) {
-            node = &nodes[list[i]];
-            if (EXPIRED(node, now)) {
-                cache->active -= 1;
-                tmp = list[cache->active];
-                list[cache->active] = list[i];
-                list[i] = tmp;
-                i--;
-            }
-        }
-
-        if (cache->active < cache->count) {
-            node = &config->nodes[config->list[cache->active]];
-            cache->active += 1;
-            memcpy(node, new_data, sizeof(upload_progress_node_t));
-            up_log(APLOG_MARK, APLOG_DEBUG, 0, server,
-                   "Upload Progress: Added upload with id='%" UP_ID_FMT "' to list.", node->key);
-        } else {
-            ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, server, "Cache full");
-        }
-
+    if (!query) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, server,
+            "Failed to create query string - we're in deep poopy");
+        return -1;
     }
-    CACHE_UNLOCK();
+    if ((rv = safe_mysql_query(r, query, config))) {
+        if (config->dbh)
+        {
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, server,
+                "Query call failed: %s (%i)", mysql_error(config->dbh), rv);
+        }
 
-}
-
-static apr_status_t upload_progress_cache_init(apr_pool_t *pool, ServerConfig *config)
-{
-/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, global_server, "upload_progress_cache_init()");
-
-    apr_status_t result;
-    apr_size_t size;
-    int nodes_cnt, i;
-
-    if (config->cache_file) {
-        /* Remove any existing shm segment with this name. */
-        apr_shm_remove(config->cache_file, pool);
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, server, "Failed query was: [%s]", query);
+        return -1;
     }
 
-    size = APR_ALIGN_DEFAULT(config->cache_bytes);
-    result = apr_shm_create(&config->cache_shm, size, config->cache_file, pool);
-    if (result != APR_SUCCESS) {
-        return result;
-    }
-
-    /* Determine the usable size of the shm segment. */
-    size = apr_shm_size_get(config->cache_shm);
-    nodes_cnt = (size - sizeof(upload_progress_cache_t)) /
-                (sizeof(int) + sizeof(upload_progress_node_t));
-
-    /* init cache */
-    config->cache = (upload_progress_cache_t *)apr_shm_baseaddr_get(config->cache_shm);
-    config->list = (int *)(config->cache + 1);
-    config->nodes = (upload_progress_node_t *)(config->list + nodes_cnt);
-    config->cache->count = nodes_cnt;
-    config->cache->active = 0;
-    for (i = 0; i < nodes_cnt; i++) config->list[i] = i;
-
-    ap_log_error(APLOG_MARK, APLOG_INFO, 0, global_server,
-                 "Upload Progress: monitoring max %i simultaneous uploads, id (%s) length %i..%i",
-                 nodes_cnt, PROGRESS_ID, ARG_MINLEN_PROGRESSID, ARG_MAXLEN_PROGRESSID);
-
-    return APR_SUCCESS;
-}
-
-static int upload_progress_init(apr_pool_t *p, apr_pool_t *plog,
-                    apr_pool_t *ptemp,
-                    server_rec *s) {
-/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, s, "upload_progress_init()");
-
-    apr_status_t result;
-
-    ServerConfig *config = get_server_config(s);
-
-    void *data;
-    const char *userdata_key = "upload_progress_init";
-
-    /* upload_progress_init will be called twice. Don't bother
-     * going through all of the initialization on the first call
-     * because it will just be thrown away.*/
-    apr_pool_userdata_get(&data, userdata_key, s->process->pool);
-    if (!data) {
-        apr_pool_userdata_set((const void *)1, userdata_key,
-                               apr_pool_cleanup_null, s->process->pool);
-
-        /* If the cache file already exists then delete it.  Otherwise we are
-         * going to run into problems creating the shared memory. */
-        if (config->cache_file) {
-            char *lck_file = apr_pstrcat(ptemp, config->cache_file, ".lck",
-                                         NULL);
-            up_log(APLOG_MARK, APLOG_DEBUG, 0, s, "Upload Progress: Remove lock file");
-            apr_file_remove(lck_file, ptemp);
-        }
-        return OK;
-    }
-
-    /* initializing cache if shared memory size is not zero and we already
-     * don't have shm address
-     */
-    if (!config->cache_shm && config->cache_bytes > 0) {
-        result = upload_progress_cache_init(p, config);
-        if (result != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_ERR, result, s,
-                         "Upload Progress cache: could not create shared memory segment");
-            return DONE;
-        }
-
-        if (config->cache_file) {
-            config->lock_file = apr_pstrcat(p, config->cache_file, ".lck",
-                                        NULL);
-        }
-
-        result = apr_global_mutex_create(&config->cache_lock,
-                                         config->lock_file, APR_LOCK_DEFAULT,
-                                         p);
-        if (result != APR_SUCCESS) {
-            return result;
-        }
-
-#ifdef AP_NEED_SET_MUTEX_PERMS
-        result = unixd_set_global_mutex_perms(config->cache_lock);
-        if (result != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_CRIT, result, s,
-                         "Upload progress cache: failed to set mutex permissions");
-            return result;
-        }
-#endif
-
-    } else {
-        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s,
-                     "Upload Progress cache: cache size is zero, disabling "
-                     "shared memory cache");
-    }
-
-    return(OK);
+    return 0;
 }
 
 static int reportuploads_handler(request_rec *r)
@@ -635,8 +688,11 @@ static int reportuploads_handler(request_rec *r)
     server_rec *server = r->server;
 /**/up_log(APLOG_MARK, APLOG_DEBUG, 0, server, "reportuploads_handler()");
 
-    upload_progress_node_t upload, *found;
     int param_error;
+    char *query;
+    MYSQL_RES *result;
+    MYSQL_ROW row;
+    int rv;
     char *response;
     DirConfig *dir = get_dir_config(r);
 
@@ -667,17 +723,30 @@ static int reportuploads_handler(request_rec *r)
 
     ServerConfig *config = get_server_config(server);
 
-    CACHE_LOCK();
-    found = find_node(server, id);
-    if (found) {
-        up_log(APLOG_MARK, APLOG_DEBUG, 0, server,
-                     "Node with id=%s found for report", id);
-        memcpy(&upload, found, sizeof(upload));
-    } else {
-        up_log(APLOG_MARK, APLOG_DEBUG, 0, server,
-                     "Node with id=%s not found for report", id);
+    query = (char *) apr_psprintf(r->pool, "SELECT id, err_status, length, received, done, speed, started_at, updated_at "
+                "FROM %s WHERE id = '%s'", dir->track_table, id);
+
+    if (!query) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, server,
+                    "Failed to create query string - we're in deep poopy");
+        return HTTP_INTERNAL_SERVER_ERROR;
     }
-    CACHE_UNLOCK();
+
+    if ((rv = safe_mysql_query(r, query, config))) {
+        if (config->dbh) {
+            ap_log_error(APLOG_MARK, APLOG_ERR, 0, server,
+                "Query call failed: %s (%i)", mysql_error(config->dbh), rv);
+        }
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, server, "Failed query was: [%s]", query);
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    result = safe_mysql_store_result(r->pool, config);
+    if (!result) {
+        ap_log_error(APLOG_MARK, APLOG_ERR, 0, server,
+                    "Failed to get MySQL result structure : %s", mysql_error(config->dbh));
+        return HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     ap_set_content_type(r, "application/json");
 
@@ -692,38 +761,51 @@ static int reportuploads_handler(request_rec *r)
      * request in progress:     rest > 0
      */
 
-    if (!found) {
-        response = apr_psprintf(r->pool, "{ \"state\" : \"starting\", \"uuid\" : \"%s\" }", id);
-    } else if (upload.err_status >= HTTP_BAD_REQUEST  ) {
-        response = apr_psprintf(r->pool, "{ "
-            "\"state\": \"error\", "
-            "\"status\": %d, "
-            "\"uuid\": \"%s\" "
-            "}", upload.err_status, id);
-    } else if (upload.done) {
-        response = apr_psprintf(r->pool, "{ "
-            "\"state\": \"done\", "
-            "\"size\": %" APR_OFF_T_FMT ", "
-            "\"speed\": %" APR_OFF_T_FMT ", "
-            "\"started_at\": %li, "
-            "\"completed_at\": %li, "
-            "\"uuid\": \"%s\" "
-            "}", upload.length, upload.speed, upload.started_at, upload.updated_at, id);
-    } else if (upload.received == 0) {
+    if (!result || (row=mysql_fetch_row(result))==NULL || !row[0]) {
         response = apr_psprintf(r->pool, "{ \"state\" : \"starting\", \"uuid\" : \"%s\" }", id);
     } else {
-        time_t eta = 0, t = time(NULL);
-        if (upload.speed > 0) eta = upload.started_at + upload.length / upload.speed;
-        if (eta <= t) eta = t + 1;
-        response = apr_psprintf(r->pool, "{ "
-            "\"state\": \"uploading\", "
-            "\"received\": %" APR_OFF_T_FMT ", "
-            "\"size\": %" APR_OFF_T_FMT ", "
-            "\"speed\": %" APR_OFF_T_FMT ", "
-            "\"started_at\": %li, "
-            "\"eta\": %li, "
-            "\"uuid\": \"%s\" "
-            "}", upload.received, upload.length, upload.speed, upload.started_at, eta, id);
+        int err_status = atoi(row[1]);
+        if (err_status >= HTTP_BAD_REQUEST  ) {
+            response = apr_psprintf(r->pool, "{ "
+                "\"state\": \"error\", "
+                "\"status\": %s, "
+                "\"uuid\": \"%s\" "
+                "}", row[1], id);
+        } else if (strcmp(row[4], "1") == 0) {
+            response = apr_psprintf(r->pool, "{ "
+                "\"state\": \"done\", "
+                "\"size\": %s, "
+                "\"speed\": %s, "
+                "\"started_at\": %s, "
+                "\"completed_at\": %s, "
+                "\"uuid\": \"%s\" "
+                "}", row[2], row[5], row[6], row[7], id);
+        } else if (strcmp(row[3], "0") == 0) {
+            response = apr_psprintf(r->pool, "{ \"state\" : \"starting\", \"uuid\" : \"%s\" }", id);
+        } else {
+            time_t eta = 0, t = time(NULL);
+            time_t started_at = atoi(row[6]);
+            char *err;
+            apr_off_t speed;
+            apr_off_t length;
+            if (apr_strtoff(&speed, row[5], &err, 10) || *err) {
+                speed = 0;
+            }
+            if (apr_strtoff(&length, row[2], &err, 10) || *err) {
+                length = 0;
+            }
+            if (speed > 0) eta = started_at + length / speed;
+            if (eta <= t) eta = t + 1;
+            response = apr_psprintf(r->pool, "{ "
+                "\"state\": \"uploading\", "
+                "\"received\": %s, "
+                "\"size\": %s, "
+                "\"speed\": %s, "
+                "\"started_at\": %s, "
+                "\"eta\": %li, "
+                "\"uuid\": \"%s\" "
+                "}", row[3], row[2], row[5], row[6], eta, id);
+        }
     }
 
     char *completed_response;
@@ -752,47 +834,24 @@ static int reportuploads_handler(request_rec *r)
     return OK;
 }
 
-static void upload_progress_child_init(apr_pool_t *p, server_rec *s)
-{
-/**/up_log(APLOG_MARK, APLOG_DEBUG, 0, s, "upload_progress_child_init()");
-
-    apr_status_t rv;
-    ServerConfig *config = get_server_config(s);
-
-    if (!config->cache_lock) {
-        ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s, "Global mutex not set.");
-        return;
-    }
-
-    rv = apr_global_mutex_child_init(&config->cache_lock, config->lock_file, p);
-    if (rv != APR_SUCCESS) {
-        ap_log_error(APLOG_MARK, APLOG_CRIT, rv, s,
-                     "Failed to initialise global mutex %s in child process %"
-                     APR_PID_T_FMT ".", config->lock_file, getpid());
-    }
-
-    if (!config->cache_shm) {
-        rv = apr_shm_attach(&config->cache_shm, config->cache_file, p);
-        if (rv != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_CRIT, rv, s, "Failed to attach to "
-                         "shared memory file '%s'", config->cache_file);
-            return;
-        }
-    }
-
-    config->cache = (upload_progress_cache_t *)apr_shm_baseaddr_get(config->cache_shm);
-    config->list = (int *)(config->cache + 1);
-    config->nodes = (upload_progress_node_t *)(config->list + config->cache->count);
-}
-
 static const command_rec upload_progress_cmds[] =
 {
     AP_INIT_FLAG("TrackUploads", track_upload_progress_cmd, NULL, OR_AUTHCFG,
                  "Track upload progress in this location"),
     AP_INIT_FLAG("ReportUploads", report_upload_progress_cmd, NULL, OR_AUTHCFG,
                  "Report upload progress in this location"),
-    AP_INIT_TAKE1("UploadProgressSharedMemorySize", upload_progress_shared_memory_size_cmd, NULL, RSRC_CONF,
-                 "Size of shared memory used to keep uploads data, default 100KB"),
+    AP_INIT_TAKE1("TrackTable", table_upload_progress_cmd, NULL, OR_AUTHCFG,
+                 "The name of table where uploads are saved"),
+    AP_INIT_TAKE1("TrackID", key_upload_progress_cmd, NULL, OR_AUTHCFG,
+                 "The name of progress id"),
+    AP_INIT_TAKE3("Upload_Progress_MySQL_Info", upload_progress_mysql_info, NULL, RSRC_CONF,
+                  "host, user, password of the MySQL database"),
+    AP_INIT_TAKE1("Upload_Progress_MySQL_DefaultPort",    upload_progress_mysql_port, NULL, RSRC_CONF,
+                  "Default MySQL server port"),
+    AP_INIT_TAKE1("Upload_Progress_MySQL_DefaultSocket", upload_progress_mysql_socket, NULL, RSRC_CONF,
+                  "Default MySQL server socket"),
+    AP_INIT_TAKE1("Upload_Progress_MySQL_Database", upload_progress_mysql_db, NULL, RSRC_CONF,
+                  "database for MySQL upload progress" ),
     { NULL }
 };
 
@@ -802,8 +861,6 @@ static void upload_progress_register_hooks (apr_pool_t *p)
 
     ap_hook_fixups(upload_progress_handle_request, NULL, NULL, APR_HOOK_FIRST);
     ap_hook_handler(reportuploads_handler, NULL, NULL, APR_HOOK_FIRST);
-    ap_hook_post_config(upload_progress_init, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_child_init(upload_progress_child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_register_input_filter("UPLOAD_PROGRESS", track_upload_progress, NULL, AP_FTYPE_RESOURCE);
 }
 
@@ -813,7 +870,7 @@ module AP_MODULE_DECLARE_DATA upload_progress_module =
     upload_progress_create_dir_config,
     upload_progress_merge_dir_config,
     upload_progress_create_server_config,
-    upload_progress_merge_server_config,
+    NULL, // upload_progress_merge_server_config,
     upload_progress_cmds,
     upload_progress_register_hooks,      /* callback for registering hooks */
 };
