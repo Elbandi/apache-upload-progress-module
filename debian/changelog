@@ -1,0 +1,5 @@
+mod-upload-progress-mysql (0.3-1) lucid; urgency=low
+
+  * Initial import
+
+ -- Andras Elso <elso.andras@gmail.com>  Wed, 31 Jul 2013 16:07:05 +0200

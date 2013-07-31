@@ -4,9 +4,9 @@ SRCS	= mod_upload_progress.c
 HDRS	= config.h
 OPTS	= @build_opts@ -lmysqlclient
 
-all: mod_upload_progress.so
+all: mod_upload_progress_mysql.so
 
-mod_upload_progress.so: $(SRCS) $(HDRS)
+mod_upload_progress_mysql.so: $(SRCS) $(HDRS)
 	$(APXS2) $(APXS2FLAGS) -o $@ $(OPTS) -DAPACHE2 -c $(SRCS)
 
 clean:

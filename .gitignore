@@ -5,5 +5,4 @@
 *.slo
 *.la
 .pc
-debian/
 local-options.mk

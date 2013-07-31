@@ -1,0 +1,1 @@
+LoadModule upload_progress_mysql_module /usr/lib/apache2/modules/mod_upload_progress_mysql.so
